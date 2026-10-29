@@ -136,6 +136,15 @@ dialog::backdrop{background:rgba(0,0,0,.45)}
 dialog label{display:block;font-size:15px;color:var(--muted);margin-top:14px}
 dialog input{width:100%;border:1px solid var(--line);background:var(--sunk);border-radius:12px;padding:10px 12px;min-height:44px;margin-top:4px}
 .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}
+.timerow input{flex:1;min-width:0;border:1px solid var(--line);background:var(--sunk);border-radius:12px;padding:10px 12px;min-height:44px}
+.daylist{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px;font-size:14px;color:var(--muted)}
+.mini{border:1px solid var(--line);background:var(--sunk);border-radius:999px;padding:6px 12px;min-height:36px;font-size:14px;font-variant-numeric:tabular-nums}
+.mini b{color:var(--ink)}
+.mini[aria-current="true"]{border-color:var(--me);background:var(--me-soft)}
+.newbtn{display:block;margin:4px auto 0}
+.cells{display:flex;flex-direction:column;padding:2px 0}
+.cells .cell{min-height:36px;padding:6px}
+.cells .avg{font-size:12px;color:var(--muted);padding:0 6px 6px}
 .dlg-actions .save{width:auto;padding:0 20px;min-height:44px;font-size:16px}
 
 @media (prefers-reduced-motion: reduce){*{transition:none !important}}
@@ -173,9 +182,16 @@ dialog input{width:100%;border:1px solid var(--line);background:var(--sunk);bord
             <input id="dateInput" type="date">
             <button type="button" class="chip" id="todayBtn">Today</button>
           </div>
+          <div class="daterow timerow">
+            <label for="timeInput">Time</label>
+            <input id="timeInput" type="time">
+            <button type="button" class="chip" id="nowBtn">Now</button>
+          </div>
+          <div class="daylist" id="dayList" hidden></div>
           <button class="save" id="saveBtn" type="submit">Save weight</button>
           <p class="status" id="status" aria-live="polite"></p>
-          <button type="button" class="linkbtn del" id="delBtn" hidden>Delete this entry</button>
+          <button type="button" class="linkbtn del" id="delBtn" hidden>Delete this weigh-in</button>
+          <button type="button" class="linkbtn newbtn" id="newBtn" hidden>Add a new weigh-in instead</button>
         </form>
       </section>
 
@@ -214,7 +230,7 @@ dialog input{width:100%;border:1px solid var(--line);background:var(--sunk);bord
 <script>
 /* ===== Paste your Cloudflare Worker address here after `wrangler deploy` ===== */
 const CONFIG = {
-  api: 'https://weigh-in-api.weigh-in-api.workers.dev',                 // e.g. https://weigh-in-api.yourname.workers.dev
+  api: 'https://weigh-in-api.weigh-in-api.workers.dev',
   people: { p1: 'Akhil', p2: 'Meethu' }   // must match PEOPLE in wrangler.toml
 };
 /* ============================================================================ */
@@ -264,15 +280,22 @@ const CONFIG = {
   }
 
   /* ---------- data helpers ---------- */
-  const entryFor = (p,d) => state.entries.find(e => e.person === p && e.date === d);
-  function listFor(p){ return state.entries.filter(e => e.person === p).sort((a,b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0); }
+  const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  const nowTime = () => { const d = new Date(); return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); };
+  const whenKey = e => e.date + ' ' + (e.time || '');
+  const byWhen = (a,b) => whenKey(a) < whenKey(b) ? -1 : whenKey(a) > whenKey(b) ? 1 : 0;
+  const same = (x,p,d,t) => x.person === p && x.date === d && (x.time || '') === (t || '');
+  const entriesOn = (p,d) => state.entries.filter(e => e.person === p && e.date === d).sort(byWhen);
+  function dayAvg(p,d){ const xs = entriesOn(p,d); return xs.length ? xs.reduce((a,e) => a + e.kg, 0) / xs.length : null; }
+  function daysFor(p){ return [...new Set(state.entries.filter(e => e.person === p).map(e => e.date))].sort(); }
+  function listFor(p){ return state.entries.filter(e => e.person === p).sort(byWhen); }
   function lastOnOrBefore(p,d){
     let best = null;
-    for(const e of state.entries) if(e.person === p && e.date <= d && (!best || e.date > best.date)) best = e;
+    for(const e of state.entries) if(e.person === p && e.date <= d && (!best || whenKey(e) > whenKey(best))) best = e;
     return best;
   }
-  const upsert = (list, e) => list.filter(x => !(x.person === e.person && x.date === e.date)).concat([e]);
-  const removeOne = (list, p, d) => list.filter(x => !(x.person === p && x.date === d));
+  const upsert = (list, e, oldTime) => list.filter(x => !same(x, e.person, e.date, e.time) && !(oldTime != null && same(x, e.person, e.date, oldTime))).concat([e]);
+  const removeOne = (list, p, d, t) => list.filter(x => !same(x, p, d, t));
 
   /* weights.json  <->  entries */
   function fromJson(obj){
@@ -281,21 +304,11 @@ const CONFIG = {
       const arr = obj && Array.isArray(obj[NAMES[p]]) ? obj[NAMES[p]] : [];
       arr.forEach(x => {
         const kg = Number(x && x.weight);
-        if(x && /^\d{4}-\d{2}-\d{2}$/.test(x.date) && isFinite(kg)) out.push({person:p, date:x.date, kg});
+        if(x && /^\d{4}-\d{2}-\d{2}$/.test(x.date) && isFinite(kg)) out.push({person:p, date:x.date, time: TIME_RE.test(x.time) ? x.time : '', kg});
       });
     });
     return out;
   }
-  function toJson(base, entries){
-    const obj = Object.assign({}, base && typeof base === 'object' && !Array.isArray(base) ? base : {});
-    PEOPLE.forEach(p => {
-      obj[NAMES[p]] = entries.filter(e => e.person === p)
-        .sort((a,b) => a.date < b.date ? -1 : 1)
-        .map(e => ({ date:e.date, weight: Math.round(e.kg*10)/10 }));
-    });
-    return obj;
-  }
-
   /* ---------- server (Cloudflare Worker -> GitHub) ---------- */
   async function call(method, body){
     const r = await fetch(API, {
@@ -332,39 +345,70 @@ const CONFIG = {
   }
 
   /* ---------- UI state ---------- */
-  const form = { date: todayStr(), dirty:false };
+  // editing: null when adding a new weigh-in, otherwise the time ('' for old untimed entries) of the one being edited
+  const form = { date: todayStr(), time: nowTime(), timeTouched:false, editing:null, dirty:false };
   let delArmed = null;
   function setStatus(text, err){ const s = $('#status'); s.textContent = text; s.classList.toggle('err', !!err); }
 
   function loadForm(){
-    const ex = entryFor(state.who, form.date);
-    const prev = lastOnOrBefore(state.who, form.date);
-    $('#kg').value = ex ? fmtKg(ex.kg) : (prev ? fmtKg(prev.kg) : '');
+    if(form.editing !== null){
+      const ex = state.entries.find(x => same(x, state.who, form.date, form.editing));
+      if(ex){ $('#kg').value = fmtKg(ex.kg); $('#timeInput').value = ex.time; }
+      else form.editing = null;
+    }
+    if(form.editing === null){
+      if(!form.timeTouched) form.time = nowTime();
+      const prev = lastOnOrBefore(state.who, form.date);
+      $('#kg').value = prev ? fmtKg(prev.kg) : '';
+      $('#timeInput').value = form.time;
+    }
     form.dirty = false;
     formChrome();
   }
+  function startNew(){ form.editing = null; form.timeTouched = false; }
+  function editEntry(p, d, t){
+    form.date = d; form.editing = t || ''; setStatus('');
+    if(state.who !== p) selectWho(p); else loadForm();
+  }
   function formChrome(){
     const name = NAMES[state.who];
-    const ex = entryFor(state.who, form.date);
+    const editing = form.editing !== null;
     const isToday = form.date === todayStr();
-    $('#entryTitle').textContent = (isToday ? name + '’s weight today' : name + '’s weight on ' + fmtLong(form.date)) + (ex ? ' (saved)' : '');
-    $('#saveBtn').textContent = ex ? 'Update weight' : 'Save weight';
-    $('#delBtn').hidden = !ex;
+    const dayLabel = isToday ? 'today' : 'on ' + fmtLong(form.date);
+    $('#entryTitle').textContent = editing
+      ? 'Editing ' + name + '’s weigh-in ' + dayLabel + (form.editing ? ' at ' + form.editing : '')
+      : name + '’s weight ' + dayLabel;
+    $('#saveBtn').textContent = editing ? 'Update weigh-in' : 'Add weigh-in';
+    $('#delBtn').hidden = !editing;
+    $('#newBtn').hidden = !editing;
     $('#dateInput').value = form.date;
     $('#dateInput').max = todayStr();
     $('#todayBtn').hidden = isToday;
-    if(!ex) disarmDelete();
+    if(!editing) disarmDelete();
+
+    const box = $('#dayList'); box.textContent = '';
+    const xs = entriesOn(state.who, form.date);
+    box.hidden = !xs.length;
+    if(xs.length){
+      box.appendChild(el('span', {text: (isToday ? 'Today' : 'This day') + ' so far:'}));
+      xs.forEach(e => box.appendChild(el('button', {
+        type:'button', class:'mini',
+        'aria-current': String(editing && (e.time || '') === form.editing),
+        'aria-label': 'Edit ' + fmtKg(e.kg) + ' kg' + (e.time ? ' at ' + e.time : ''),
+        onclick: () => editEntry(state.who, e.date, e.time)
+      }, [(e.time ? e.time + '  ' : ''), el('b', {text: fmtKg(e.kg)})])));
+    }
   }
   function disarmDelete(){
     if(delArmed){ clearTimeout(delArmed); delArmed = null; }
-    $('#delBtn').textContent = 'Delete this entry';
+    $('#delBtn').textContent = 'Delete this weigh-in';
   }
   function readKg(){
     const v = parseFloat(String($('#kg').value).replace(',', '.'));
     return isFinite(v) ? v : null;
   }
 
-  async function runChange(optimistic, request, okText){
+  async function runChange(optimistic, request, okText, onOk){
     const before = state.entries;
     state.entries = optimistic(state.entries);
     state.busy = true; $('#saveBtn').disabled = true;
@@ -372,6 +416,7 @@ const CONFIG = {
     try{
       state.entries = fromJson(await call('POST', request));
       form.dirty = false;
+      if(onOk) onOk();
       setStatus(okText); setSync(syncedText());
     }catch(err){
       state.entries = before;
@@ -387,11 +432,15 @@ const CONFIG = {
     if(!apiReady()){ setStatus('Saving isn’t set up yet. Add the Worker address to index.html.', true); return; }
     const v = readKg();
     if(v === null || v < 20 || v > 350){ setStatus('Enter a weight between 20 and 350 kg.', true); $('#kg').focus(); return; }
-    const e = { person:state.who, date:form.date, kg: Math.round(v*10)/10 };
+    const time = TIME_RE.test($('#timeInput').value) ? $('#timeInput').value : nowTime();
+    const e = { person:state.who, date:form.date, time, kg: Math.round(v*10)/10 };
     const name = NAMES[e.person];
-    runChange(list => upsert(list, e),
-      { action:'save', person:name, date:e.date, weight:e.kg },
-      'Saved ' + fmtKg(e.kg) + ' kg for ' + name + ', ' + fmtLong(e.date) + '.');
+    const oldTime = form.editing;
+    const req = { action:'save', person:name, date:e.date, time:e.time, weight:e.kg };
+    if(oldTime !== null) req.oldTime = oldTime;
+    runChange(list => upsert(list, e, oldTime), req,
+      (oldTime !== null ? 'Updated ' : 'Added ') + fmtKg(e.kg) + ' kg for ' + name + ', ' + fmtLong(e.date) + ' at ' + e.time + '.',
+      startNew);
   });
   $('#kg').addEventListener('input', () => { form.dirty = true; setStatus(''); });
   document.querySelectorAll('.step').forEach(b => b.addEventListener('click', () => {
@@ -404,9 +453,19 @@ const CONFIG = {
   $('#dateInput').addEventListener('change', e => {
     const v = e.target.value;
     form.date = (v && v <= todayStr()) ? v : todayStr();
-    setStatus(''); loadForm();
+    form.editing = null; setStatus(''); loadForm();
   });
-  $('#todayBtn').addEventListener('click', () => { form.date = todayStr(); setStatus(''); loadForm(); });
+  $('#todayBtn').addEventListener('click', () => { form.date = todayStr(); form.editing = null; setStatus(''); loadForm(); });
+  $('#timeInput').addEventListener('input', e => {
+    if(form.editing === null){ form.time = e.target.value; form.timeTouched = true; }
+    form.dirty = true; setStatus('');
+  });
+  $('#nowBtn').addEventListener('click', () => {
+    $('#timeInput').value = nowTime();
+    if(form.editing === null){ form.time = $('#timeInput').value; form.timeTouched = false; }
+    form.dirty = true;
+  });
+  $('#newBtn').addEventListener('click', () => { startNew(); setStatus(''); loadForm(); });
   $('#delBtn').addEventListener('click', () => {
     if(state.busy) return;
     if(!delArmed){
@@ -415,10 +474,11 @@ const CONFIG = {
       return;
     }
     disarmDelete();
-    const p = state.who, d = form.date;
-    runChange(list => removeOne(list, p, d),
-      { action:'delete', person:NAMES[p], date:d },
-      'Deleted ' + NAMES[p] + '’s entry for ' + fmtLong(d) + '.');
+    const p = state.who, d = form.date, t = form.editing;
+    runChange(list => removeOne(list, p, d, t),
+      { action:'delete', person:NAMES[p], date:d, time:t },
+      'Deleted ' + NAMES[p] + '’s weigh-in for ' + fmtLong(d) + (t ? ' at ' + t : '') + '.',
+      startNew);
   });
 
   function selectWho(p){
@@ -433,7 +493,7 @@ const CONFIG = {
   function renderWho(){
     const box = $('#who'); box.textContent = '';
     PEOPLE.forEach(p => {
-      box.appendChild(el('button', {type:'button', 'aria-pressed': String(state.who === p), onclick: () => selectWho(p)}, [
+      box.appendChild(el('button', {type:'button', 'aria-pressed': String(state.who === p), onclick: () => { startNew(); selectWho(p); }}, [
         el('span', {class:'dot ' + p}), el('span', {class:'n', text: NAMES[p]})
       ]));
     });
@@ -449,15 +509,16 @@ const CONFIG = {
       if(!list.length){
         card.appendChild(el('p', {class:'empty', text: state.loading ? 'Loading…' : 'No weigh-ins yet'}));
       } else {
-        const last = list[list.length-1], first = list[0];
-        const cutoff = addDays(last.date, -7);
-        let weekRef = null;
-        for(const e of list) if(e.date <= cutoff) weekRef = e;
+        const last = list[list.length-1];
+        const days = daysFor(p), lastDay = days[days.length-1], firstDay = days[0];
+        const lastAvg = dayAvg(p, lastDay);
+        let refDay = null;
+        for(const d of days) if(d <= addDays(lastDay, -7)) refDay = d;
         card.appendChild(el('div', {class:'big'}, [fmtKg(last.kg), el('small', {text:'kg'})]));
-        card.appendChild(el('div', {class:'when', text: last.date === todayStr() ? 'Today' : fmtLong(last.date)}));
+        card.appendChild(el('div', {class:'when', text: (last.date === todayStr() ? 'Today' : fmtLong(last.date)) + (last.time ? ', ' + last.time : '')}));
         const rows = [];
-        if(weekRef) rows.push(['Last 7 days', signed(last.kg - weekRef.kg) + ' kg']);
-        if(list.length > 1) rows.push(['Since ' + fmtShort(first.date), signed(last.kg - first.kg) + ' kg']);
+        if(refDay) rows.push(['Last 7 days', signed(lastAvg - dayAvg(p, refDay)) + ' kg']);
+        if(days.length > 1) rows.push(['Since ' + fmtShort(firstDay), signed(lastAvg - dayAvg(p, firstDay)) + ' kg']);
         if(rows.length) card.appendChild(el('dl', null, rows.map(r => el('div', null, [el('dt', {text:r[0]}), el('dd', {text:r[1]})]))));
       }
       box.appendChild(card);
@@ -471,21 +532,21 @@ const CONFIG = {
     if(state.view === 'daily'){
       const days = [];
       for(let i = 29; i >= 0; i--) days.push(addDays(today, -i));
-      return { labels: days.map(fmtShort), sets: PEOPLE.map(p => days.map(d => { const e = entryFor(p,d); return e ? e.kg : null; })) };
+      return { labels: days.map(fmtShort), sets: PEOPLE.map(p => days.map(d => { const a = dayAvg(p,d); return a === null ? null : Math.round(a*10)/10; })) };
     }
     const mon = mondayOf(today), weeks = [];
     for(let i = 11; i >= 0; i--) weeks.push(addDays(mon, -7*i));
     return {
       labels: weeks.map(fmtShort),
       sets: PEOPLE.map(p => weeks.map(w => {
-        const xs = state.entries.filter(e => e.person === p && mondayOf(e.date) === w).map(e => e.kg);
+        const xs = daysFor(p).filter(d => mondayOf(d) === w).map(d => dayAvg(p,d));
         return xs.length ? Math.round(xs.reduce((a,b) => a+b, 0) / xs.length * 10) / 10 : null;
       }))
     };
   }
   function renderChart(){
     document.querySelectorAll('.seg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.view === state.view)));
-    $('#chartCaption').textContent = state.view === 'daily' ? 'Each day, last 30 days' : 'Weekly average (Mon–Sun), last 12 weeks';
+    $('#chartCaption').textContent = state.view === 'daily' ? 'Daily average, last 30 days' : 'Weekly average (Mon–Sun), last 12 weeks';
     const lg = $('#legend'); lg.textContent = '';
     PEOPLE.forEach(p => lg.appendChild(el('span', null, [el('span', {class:'dot ' + p}), NAMES[p]])));
 
@@ -535,8 +596,6 @@ const CONFIG = {
     const dates = [...new Set(state.entries.map(e => e.date))].sort().reverse();
     $('#histEmpty').hidden = dates.length > 0 || state.loading;
     if(!dates.length){ $('#moreBtn').hidden = true; return; }
-    const prevMap = {};
-    PEOPLE.forEach(p => { const list = listFor(p); list.forEach((e,i) => { prevMap[p + '_' + e.date] = i > 0 ? list[i-1].kg : null; }); });
     table.appendChild(el('thead', null, [el('tr', null, [
       el('th', {text:'Date'}),
       ...PEOPLE.map(p => el('th', null, [el('span', {class:'dot ' + p}), NAMES[p]]))
@@ -546,19 +605,26 @@ const CONFIG = {
     (state.showAll ? dates : dates.slice(0, 21)).forEach(d => {
       const tr = el('tr', null, [el('td', {class:'d' + (d === today ? ' today' : ''), text: d === today ? 'Today' : fmtLong(d)})]);
       PEOPLE.forEach(p => {
-        const e = entryFor(p, d);
-        const prev = prevMap[p + '_' + d];
-        const kids = e ? [el('b', {text: fmtKg(e.kg)}), (prev !== null && prev !== undefined) ? el('i', {text: signed(e.kg - prev)}) : null] : ['—'];
-        tr.appendChild(el('td', null, [el('button', {
-          type:'button', class:'cell' + (e ? '' : ' none'),
-          'aria-label': (e ? 'Edit ' : 'Add ') + NAMES[p] + '’s weight for ' + fmtLong(d),
-          onclick: () => {
-            form.date = d; setStatus('');
-            if(state.who !== p) selectWho(p); else loadForm();
-            if(window.innerWidth < 900) $('#entryPanel').scrollIntoView({behavior:'smooth', block:'start'});
-            $('#kg').focus({preventScroll:true});
-          }
-        }, kids)]));
+        const xs = entriesOn(p, d);
+        const goForm = () => {
+          if(window.innerWidth < 900) $('#entryPanel').scrollIntoView({behavior:'smooth', block:'start'});
+          $('#kg').focus({preventScroll:true});
+        };
+        let content;
+        if(!xs.length){
+          content = el('button', {
+            type:'button', class:'cell none', 'aria-label': 'Add ' + NAMES[p] + '’s weight for ' + fmtLong(d),
+            onclick: () => { form.date = d; startNew(); setStatus(''); if(state.who !== p) selectWho(p); else loadForm(); goForm(); }
+          }, ['—']);
+        } else {
+          content = el('div', {class:'cells'}, xs.map(e => el('button', {
+            type:'button', class:'cell',
+            'aria-label': 'Edit ' + NAMES[p] + '’s ' + fmtKg(e.kg) + ' kg' + (e.time ? ' at ' + e.time : '') + ', ' + fmtLong(d),
+            onclick: () => { editEntry(p, d, e.time); goForm(); }
+          }, [el('b', {text: fmtKg(e.kg)}), e.time ? el('i', {text: e.time}) : null])));
+          if(xs.length > 1) content.appendChild(el('span', {class:'avg', text: 'avg ' + fmtKg(dayAvg(p, d))}));
+        }
+        tr.appendChild(el('td', null, [content]));
       });
       tb.appendChild(tr);
     });
